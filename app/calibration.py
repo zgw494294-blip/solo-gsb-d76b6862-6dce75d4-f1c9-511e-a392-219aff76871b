@@ -49,11 +49,36 @@ class CalibSample:
 
 
 @dataclass(frozen=True)
+class CalibWitness:
+    """一组能解释全部原样本的合法满档 RGB（歧义见证，仅展示，不可写回）。"""
+
+    # 与入参 channel_ids 同序的 (id, r, g, b)
+    channels: list[tuple[str, int, int, int]]
+    # 该组矩阵在补测驱动向量下的整数（四舍五入）RGB
+    observed_rgb: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class CalibSuggestion:
+    """标定不唯一时的一次补测建议（歧义见证，不保证补测一次即可唯一）。"""
+
+    # 补测驱动向量：某一路 255、其余 0，与 channel_ids 同序
+    drives: tuple[int, ...]
+    # 被单独满档点亮的通道 ID
+    channel_id: str
+    # 两组合法满档 RGB 矩阵（均能解释全部原样本），且在该驱动下预测整数 RGB 不同
+    witness_a: CalibWitness
+    witness_b: CalibWitness
+
+
+@dataclass(frozen=True)
 class CalibResult:
     status: CalibStatus
     # 与入参 channels 同序的 (id, r, g, b)；仅 unique 时有值
     channels: list[tuple[str, int, int, int]]
     message: str
+    # 仅 non_unique 时有值：一次补测建议（含驱动向量与两组歧义见证）
+    suggestion: CalibSuggestion | None = None
 
 
 def round_half_up(value: float) -> int:
@@ -163,15 +188,45 @@ def calibrate(
 
     st2, solver2 = run(m2)
     if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        second = [
+            tuple(solver2.value(x2[(i, c)]) for c in range(3)) for i in range(n)
+        ]
+        # 选择一个两组矩阵取值不同的通道：该路单独 255 点亮时，四舍五入后的
+        # 整数 RGB 即该路的满档行，必然可区分两组解（行不同 → 至少一个分量
+        # 相差 ≥ 1 的整数，四舍五入后也不同）。
+        pivot = next(i for i in range(n) if candidate[i] != second[i])
+        probe = tuple(255 if i == pivot else 0 for i in range(n))
+        obs_a = predicted_rgb(list(candidate), probe)
+        obs_b = predicted_rgb(list(second), probe)
+        suggestion = CalibSuggestion(
+            drives=probe,
+            channel_id=channel_ids[pivot],
+            witness_a=CalibWitness(
+                channels=[
+                    (channel_ids[i], candidate[i][0], candidate[i][1],
+                     candidate[i][2])
+                    for i in range(n)
+                ],
+                observed_rgb=obs_a,
+            ),
+            witness_b=CalibWitness(
+                channels=[
+                    (channel_ids[i], second[i][0], second[i][1], second[i][2])
+                    for i in range(n)
+                ],
+                observed_rgb=obs_b,
+            ),
+        )
         return CalibResult(
             status="non_unique",
             channels=[],
             message=(
                 "标定不唯一：存在多组合法的各路满档 RGB 都能解释全部样本"
-                "（模型已找到两个不同的合法参数）。请增加样本数量或覆盖更多"
-                "驱动级组合（尤其是各路单独点亮的样本），使方程组足以唯一"
-                "确定每路读数。"
+                "（模型已找到两个不同的合法参数）。可按返回的补测建议追加"
+                "一组实测样本后重新标定；该建议仅用于消除歧义，不保证补测"
+                "一次即可唯一，两组见证矩阵仅供判读、不允许写回。"
             ),
+            suggestion=suggestion,
         )
     if st2 == cp_model.INFEASIBLE:
         return CalibResult(

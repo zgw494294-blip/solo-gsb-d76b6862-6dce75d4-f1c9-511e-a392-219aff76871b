@@ -193,11 +193,36 @@ class CalibChannelResult(BaseModel):
     b: int
 
 
+class CalibWitnessResult(BaseModel):
+    """一组能解释全部原样本的合法满档 RGB 矩阵（歧义见证，不可写回）。"""
+
+    channels: list[CalibChannelResult] = Field(
+        ..., description="与请求 channels 同序的合法满档 RGB 矩阵"
+    )
+    observed_rgb: list[int] = Field(
+        ..., description="该矩阵在补测驱动向量下的整数（四舍五入）RGB"
+    )
+
+
+class CalibSuggestionResult(BaseModel):
+    """标定不唯一时的一次补测建议（仅 non_unique 状态附带）。"""
+
+    drives: list[int] = Field(
+        ..., description="补测驱动向量：某一路为 255，其余为 0，与 channels 同序"
+    )
+    channel_id: str = Field(..., description="被单独满档点亮（驱动 255）的通道 ID")
+    witness_a: CalibWitnessResult = Field(..., description="合法满档 RGB 矩阵 A")
+    witness_b: CalibWitnessResult = Field(..., description="合法满档 RGB 矩阵 B")
+
+
 class CalibrateResponse(BaseModel):
     # unique：唯一（channels 有值）；contradictory：样本矛盾；
-    # non_unique：存在多组合法参数；unknown：搜索未完成（不得据此下结论）
+    # non_unique：存在多组合法参数（附带 suggestion）；
+    # unknown：搜索未完成（不得据此下结论）
     status: Literal["unique", "contradictory", "non_unique", "unknown"]
     channels: list[CalibChannelResult] = []
+    # 仅 non_unique 时有值：一次补测建议，其他状态一律为 null
+    suggestion: CalibSuggestionResult | None = None
     message: str = ""
 
 

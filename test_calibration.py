@@ -78,20 +78,92 @@ expect(
 )
 
 # 5) 不唯一：B 路从未被驱动（B 完全不可观测）
-expect(
+r = expect(
     "一路从不点亮=不唯一",
     IDS3,
     [mk((255, 0, 0)), mk((0, 255, 0)), mk((100, 100, 0))],
     "non_unique",
 )
+# 5a) 不唯一必附带补测建议：单路 255 驱动向量 + 两组解释全部原样本、
+#     且在该驱动下整数 RGB 不同的合法见证矩阵
+sg = r.suggestion
+assert sg is not None, "non_unique 必须附带补测建议"
+assert sg.drives.count(255) == 1 and sg.drives.count(0) == 2
+assert all(d in (0, 255) for d in sg.drives)
+pivot = sg.drives.index(255)
+assert sg.channel_id == IDS3[pivot]
+assert len(sg.witness_a.channels) == len(sg.witness_b.channels) == 3
+assert [c[0] for c in sg.witness_a.channels] == IDS3
+assert [c[0] for c in sg.witness_b.channels] == IDS3
+mat_a = [tuple(c[1:]) for c in sg.witness_a.channels]
+mat_b = [tuple(c[1:]) for c in sg.witness_b.channels]
+assert mat_a != mat_b
+for mat in (mat_a, mat_b):
+    assert all(row != (0, 0, 0) for row in mat)
+    assert all(0 <= v <= 1000 for row in mat for v in row)
+    for smp in [mk((255, 0, 0)), mk((0, 255, 0)), mk((100, 100, 0))]:
+        assert predicted_rgb(mat, smp.drives) == smp.measured, "见证矩阵必须解释全部原样本"
+# 点亮的恰是两组矩阵取值不同的通道，故观测整数 RGB 不同
+assert mat_a[pivot] != mat_b[pivot]
+assert sg.witness_a.observed_rgb == predicted_rgb(mat_a, tuple(sg.drives))
+assert sg.witness_b.observed_rgb == predicted_rgb(mat_b, tuple(sg.drives))
+assert sg.witness_a.observed_rgb != sg.witness_b.observed_rgb
+print(
+    "[OK] 补测建议：probe=", sg.drives,
+    "obs_a=", sg.witness_a.observed_rgb, "obs_b=", sg.witness_b.observed_rgb,
+)
+
+# 5b) 建议字段可通过响应模型序列化；其他三态建议均为 None
+from app.schemas import CalibrateResponse
+
+resp = CalibrateResponse(
+    status=r.status, channels=[], suggestion=None, message=r.message
+)
+# 直接按 dataclass 结构构造模型（main.py 中的映射逻辑与此一致）
+from app.schemas import (
+    CalibChannelResult,
+    CalibSuggestionResult,
+    CalibWitnessResult,
+)
+
+suggestion_model = CalibSuggestionResult(
+    drives=list(sg.drives),
+    channel_id=sg.channel_id,
+    witness_a=CalibWitnessResult(
+        channels=[CalibChannelResult(id=cid, r=rr, g=gg, b=bb)
+                  for cid, rr, gg, bb in sg.witness_a.channels],
+        observed_rgb=list(sg.witness_a.observed_rgb),
+    ),
+    witness_b=CalibWitnessResult(
+        channels=[CalibChannelResult(id=cid, r=rr, g=gg, b=bb)
+                  for cid, rr, gg, bb in sg.witness_b.channels],
+        observed_rgb=list(sg.witness_b.observed_rgb),
+    ),
+)
+dumped = suggestion_model.model_dump()
+assert dumped["drives"][pivot] == 255
+assert dumped["witness_a"]["observed_rgb"] != dumped["witness_b"]["observed_rgb"]
+assert CalibrateResponse(status="unique", channels=[]).suggestion is None
+assert CalibrateResponse(status="contradictory", channels=[]).suggestion is None
+assert CalibrateResponse(status="unknown", channels=[]).suggestion is None
+print("[OK] 建议响应模型序列化；unique/contradictory/unknown 建议为 None")
 
 # 6) 不唯一：只有 d=1 的观测，四舍五入带映射到 255 标度上宽于 1 个整数
-expect(
+r6 = expect(
     "驱动过小测量粒度粗=不唯一",
     IDS3,
     [mk((1, 0, 0)), mk((0, 1, 0)), mk((0, 0, 1))],
     "non_unique",
 )
+sg6 = r6.suggestion
+assert sg6 is not None and sg6.drives.count(255) == 1
+assert sg6.witness_a.observed_rgb != sg6.witness_b.observed_rgb
+mat6_a = [tuple(c[1:]) for c in sg6.witness_a.channels]
+mat6_b = [tuple(c[1:]) for c in sg6.witness_b.channels]
+for smp in [mk((1, 0, 0)), mk((0, 1, 0)), mk((0, 0, 1))]:
+    assert predicted_rgb(mat6_a, smp.drives) == smp.measured
+    assert predicted_rgb(mat6_b, smp.drives) == smp.measured
+print("[OK] 粗粒度情形同样附带合法建议")
 
 # 7) 全零样本合法（与单路样本一起仍唯一）
 r = expect(

@@ -12,6 +12,8 @@ from .schemas import (
     CalibrateRequest,
     CalibrateResponse,
     CalibChannelResult,
+    CalibSuggestionResult,
+    CalibWitnessResult,
     ChannelSolution,
     PathSolveRequest,
     PathSolveResponse,
@@ -170,12 +172,34 @@ def api_calibrate(req: CalibrateRequest) -> CalibrateResponse:
         for s in req.samples
     ]
     result = calibrate(ids, samples)
+
+    suggestion = None
+    if result.suggestion is not None:
+        sg = result.suggestion
+
+        def witness(w) -> CalibWitnessResult:
+            return CalibWitnessResult(
+                channels=[
+                    CalibChannelResult(id=cid, r=r, g=g, b=b)
+                    for (cid, r, g, b) in w.channels
+                ],
+                observed_rgb=list(w.observed_rgb),
+            )
+
+        suggestion = CalibSuggestionResult(
+            drives=list(sg.drives),
+            channel_id=sg.channel_id,
+            witness_a=witness(sg.witness_a),
+            witness_b=witness(sg.witness_b),
+        )
+
     return CalibrateResponse(
         status=result.status,
         channels=[
             CalibChannelResult(id=cid, r=r, g=g, b=b)
             for (cid, r, g, b) in result.channels
         ],
+        suggestion=suggestion,
         message=result.message,
     )
 

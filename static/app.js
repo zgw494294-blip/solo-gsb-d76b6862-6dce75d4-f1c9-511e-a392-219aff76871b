@@ -32,10 +32,15 @@ let solution = null;
 // 最优驱动级（id -> drive），供“恢复最优”使用
 let optimalDrives = null;
 let manualMode = false;
-// 标定样本：每条 { drives: {id:int}, measured:[r,g,b] }，按 id 存以适应通道增删
+// 标定样本：每条 { drives: {id:int}, measured:[r,g,b|null] }，按 id 存以适应通道增删；
+// 补测建议创建的待填行 measured 含 null（未填完整时拒绝提交）
 let calibSamples = [];
 // 最近一次唯一标定结果（{id:{r,g,b}} + 提交时的驱动级，供实测校验/写回）
 let calibUnique = null;
+// 最近一次 non_unique 响应附带的补测建议（通道 ID 或样本变化即失效）
+let calibSuggestion = null;
+// 标定请求/建议的“代际”：通道 ID 或样本变化时 +1，迟到响应只在代际相符时才渲染
+let calibEpoch = 0;
 // 调光路径：按通道 id 存起始驱动级（0～255），适应通道增删
 let pathStart = {};
 // 最近一次路径规划结果（服务端原样返回）
@@ -106,7 +111,7 @@ function errDetailHtml(data, fallback) {
 function renderChannels() {
   const tb = $('#channel-tbody');
   tb.innerHTML = channels.map((ch, i) => `
-    <tr data-i="${i}">
+    <tr data-i="${i}" data-id="${esc(ch.id)}">
       <td class="id-cell"><input type="text" class="f-id" value="${esc(ch.id)}" maxlength="40"></td>
       <td><input type="number" class="f-r" min="0" max="1000" step="1" value="${ch.r}"></td>
       <td><input type="number" class="f-g" min="0" max="1000" step="1" value="${ch.g}"></td>
@@ -404,6 +409,19 @@ function emptySample() {
   return { drives, measured: [0, 0, 0] };
 }
 
+// 待填实测：空白 → null（未填完拒绝提交）；合法整数 → int；其余 → NaN（按非法处理）
+function parseMeasuredInput(inp) {
+  const v = inp.value.trim();
+  if (v === '') return null;
+  if (!/^[+-]?\d+$/.test(v)) return NaN;
+  return parseInt(v, 10);
+}
+
+// 该样本是否为“待填实测 RGB”的补测行
+function isPendingSample(smp) {
+  return smp.measured.some((m) => m === null);
+}
+
 function renderCalibTable() {
   reconcileCalibSamples();
   const head = $('#sample-head-row');
@@ -413,17 +431,25 @@ function renderCalibTable() {
     '<th>实测 R</th><th>实测 G</th><th>实测 B</th><th></th>';
 
   const tb = $('#sample-tbody');
-  tb.innerHTML = calibSamples.map((smp, si) => `
-    <tr data-s="${si}">
-      <td class="calib-idx">#${si + 1}</td>
+  tb.innerHTML = calibSamples.map((smp, si) => {
+    const pending = isPendingSample(smp);
+    const mCell = (c) => {
+      const m = smp.measured[c];
+      const ph = pending ? ' placeholder="待填"' : '';
+      const cls = pending ? 'cd-m cd-pending' : 'cd-m';
+      return `<td><input type="number" class="${cls}" data-c="${c}"
+               min="0" max="6000" step="1"${ph} value="${m === null || Number.isNaN(m) ? '' : m}"></td>`;
+    };
+    return `
+    <tr data-s="${si}"${pending ? ' class="calib-pending-row"' : ''}>
+      <td class="calib-idx">${pending ? '补测#' : '#'}${si + 1}</td>
       ${channels.map((c) => `
         <td><input type="number" class="cd-drive" data-id="${esc(c.id)}"
              min="0" max="255" step="1" value="${smp.drives[c.id] ?? 0}"></td>`).join('')}
-      <td><input type="number" class="cd-m" data-c="0" min="0" max="6000" step="1" value="${smp.measured[0]}"></td>
-      <td><input type="number" class="cd-m" data-c="1" min="0" max="6000" step="1" value="${smp.measured[1]}"></td>
-      <td><input type="number" class="cd-m" data-c="2" min="0" max="6000" step="1" value="${smp.measured[2]}"></td>
+      ${mCell(0)}${mCell(1)}${mCell(2)}
       <td><button type="button" class="btn small danger sample-del" ${calibSamples.length <= 3 ? 'disabled' : ''}>删除</button></td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   $('#add-sample').disabled = calibSamples.length >= 12;
 }
 
@@ -434,8 +460,10 @@ function syncCalibRow(tr) {
     smp.drives[inp.dataset.id] = intVal(inp, 0);
   });
   tr.querySelectorAll('.cd-m').forEach((inp) => {
-    smp.measured[+inp.dataset.c] = intVal(inp, 0);
+    smp.measured[+inp.dataset.c] = parseMeasuredInput(inp);
   });
+  // 三色全部填好合法整数后即成为普通行
+  if (!isPendingSample(smp)) tr.classList.remove('calib-pending-row');
 }
 
 function readCalibForm() {
@@ -453,25 +481,37 @@ function validateCalibForm() {
   if (![3, 4, 5, 6, 7, 8, 9, 10, 11, 12].includes(calibSamples.length))
     errs.push(`标定样本数为 ${calibSamples.length}，必须录入 3～12 组。`);
   calibSamples.forEach((smp, si) => {
+    const tag = isPendingSample(smp) ? '补测样本' : '样本';
     channels.forEach((c) => {
       const d = smp.drives[c.id];
       if (!Number.isInteger(d) || d < 0 || d > 255)
-        errs.push(`样本 #${si + 1} 通道 “${c.id}” 的驱动级必须是 0～255 的整数。`);
+        errs.push(`${tag} #${si + 1} 通道 “${c.id}” 的驱动级必须是 0～255 的整数。`);
     });
     smp.measured.forEach((m, c) => {
-      if (!Number.isInteger(m) || m < 0 || m > 6000)
-        errs.push(`样本 #${si + 1} 的实测 ${'RGB'[c]} 必须是 0～6000 的整数。`);
+      if (m === null)
+        errs.push(`${tag} #${si + 1} 的实测 ${'RGB'[c]} 尚未填写：补测实测 RGB 未填完整，已拒绝提交。`);
+      else if (!Number.isInteger(m) || m < 0 || m > 6000)
+        errs.push(`${tag} #${si + 1} 的实测 ${'RGB'[c]} 必须是 0～6000 的整数。`);
     });
   });
   return [...new Set(errs)];
 }
 
+// 通道 ID 或样本变化时让补测建议与在途/迟到响应失效
+function bumpCalibEpoch() {
+  calibEpoch += 1;
+}
+
 function clearCalibResult() {
+  bumpCalibEpoch();
   calibUnique = null;
+  calibSuggestion = null;
   $('#calib-result').hidden = true;
   $('#calib-status').className = 'calib-status';
   $('#calib-status').textContent = '';
   $('#calib-unique-block').hidden = true;
+  $('#calib-suggestion-block').hidden = true;
+  $('#calib-suggestion').innerHTML = '';
 }
 
 async function onCalibrate() {
@@ -483,11 +523,15 @@ async function onCalibrate() {
     showBanner('error', '<strong>样本录入有误，已拒绝提交：</strong><br>' + errs.map(esc).join('<br>'));
     return;
   }
+  // 开始一次新标定：旧建议与在途响应一律作废（建议在提交瞬间也失效，
+  // 仅由本次响应决定是否给出新建议）
+  bumpCalibEpoch();
+  const epoch = calibEpoch;
+  const orderedIds = channels.map((c) => c.id);
   const btn = $('#calib-btn');
   btn.disabled = true;
   btn.textContent = '反求中…';
   try {
-    const orderedIds = channels.map((c) => c.id);
     const resp = await fetch('/api/calibrate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -495,11 +539,14 @@ async function onCalibrate() {
         channels: orderedIds.map((id) => ({ id })),
         samples: samples.map((smp) => ({
           drives: orderedIds.map((id) => smp.drives[id]),
-          measured: smp.measured.slice(),
+          // validateCalibForm 已保证实测全部为 0～6000 整数（待填行未填完拒绝提交）
+          measured: smp.measured.map((m) => (Number.isNaN(m) ? 0 : m)),
         })),
       }),
     });
     const data = await resp.json();
+    // 等待期间通道 ID 或样本已变化：迟到响应不得恢复旧建议
+    if (epoch !== calibEpoch) return;
     if (!resp.ok) {
       clearCalibResult();
       showBanner('error', '<strong>请求被拒绝：</strong><br>' +
@@ -508,6 +555,7 @@ async function onCalibrate() {
     }
     renderCalibResult(data, samples);
   } catch (e) {
+    if (epoch !== calibEpoch) return;
     clearCalibResult();
     showBanner('error', `请求失败：${esc(e.message)}。请确认后端服务已启动。`);
   } finally {
@@ -537,9 +585,20 @@ function renderCalibResult(data, submittedSamples) {
     // 非唯一结论：不显示任何参数，也不允许写回
     $('#calib-unique-block').hidden = true;
     calibUnique = null;
+    if (data.status === 'non_unique' && data.suggestion) {
+      calibSuggestion = data.suggestion;
+      renderCalibSuggestion();
+    } else {
+      calibSuggestion = null;
+      $('#calib-suggestion-block').hidden = true;
+      $('#calib-suggestion').innerHTML = '';
+    }
     return;
   }
 
+  calibSuggestion = null;
+  $('#calib-suggestion-block').hidden = true;
+  $('#calib-suggestion').innerHTML = '';
   calibUnique = {
     readings: {},
     samples: clone(submittedSamples),
@@ -617,6 +676,99 @@ function onWriteback() {
   showBanner('info',
     `<strong>✔ 已写回 ${applied} 路满档 RGB</strong>，各路满档功率保持原值。` +
     `可直接在 ② 设置目标色后点击“求解最省功率配方”。`);
+}
+
+// 渲染 non_unique 的补测建议：驱动向量 + 两组歧义见证（只读，不可写回）
+function witnessRowsHtml(wit, pivotId) {
+  return wit.channels.map((c) => {
+    const rgb = [c.r, c.g, c.b];
+    const isPivot = c.id === pivotId;
+    return `<tr${isPivot ? ' class="pivot-row"' : ''}>
+      <td><strong>${esc(c.id)}</strong>${isPivot ? ' <span class="tag warn">点亮</span>' : ''}</td>
+      <td>${c.r}</td><td>${c.g}</td><td>${c.b}</td>
+      <td>${swatchHtml(rgb, `合法满档 RGB(${c.r}, ${c.g}, ${c.b})`)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderCalibSuggestion() {
+  const sg = calibSuggestion;
+  const block = $('#calib-suggestion-block');
+  const box = $('#calib-suggestion');
+  block.hidden = false;
+  const full = calibSamples.length >= 12;
+  const driveTxt = channels
+    .map((c) => `${esc(c.id)}=${sg.drives[channels.findIndex((x) => x.id === c.id)] ?? 0}`)
+    .join('，');
+  box.innerHTML = `
+    <div class="suggest-intro">
+      <strong>建议补测一次：</strong>只点亮通道
+      <strong class="failed">${esc(sg.channel_id)}</strong>（驱动 255，其余各路为 0：
+      <code>${driveTxt}</code>），把该组实测线性 RGB 填入新样本行后重新“反求满档读数”。
+      <strong>系统不会自动填入任何预测值</strong>；以下两组满档 RGB 都能解释全部原样本、
+      且在该驱动下预测出<strong>不同</strong>的整数 RGB（分别为
+      ${sg.witness_a.observed_rgb.join(', ')} 与 ${sg.witness_b.observed_rgb.join(', ')}），
+      它们只是歧义见证，<strong>不允许写回，也不保证补测一次即可唯一</strong>。
+    </div>
+    <div class="suggest-witnesses">
+      <div class="suggest-witness">
+        <div class="suggest-witness-title">见证矩阵 A
+          <span class="suggest-obs">该驱动下预测整数 RGB：
+            <strong>${swatchHtml(sg.witness_a.observed_rgb,
+              `预测 RGB(${sg.witness_a.observed_rgb.join(', ')})`)}
+            ${sg.witness_a.observed_rgb.join(', ')}</strong></span></div>
+        <div class="table-scroll">
+          <table class="grid witness-grid">
+            <thead><tr><th>ID</th><th>R</th><th>G</th><th>B</th><th>满档色</th></tr></thead>
+            <tbody>${witnessRowsHtml(sg.witness_a, sg.channel_id)}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="suggest-witness">
+        <div class="suggest-witness-title">见证矩阵 B
+          <span class="suggest-obs">该驱动下预测整数 RGB：
+            <strong>${swatchHtml(sg.witness_b.observed_rgb,
+              `预测 RGB(${sg.witness_b.observed_rgb.join(', ')})`)}
+            ${sg.witness_b.observed_rgb.join(', ')}</strong></span></div>
+        <div class="table-scroll">
+          <table class="grid witness-grid">
+            <thead><tr><th>ID</th><th>R</th><th>G</th><th>B</th><th>满档色</th></tr></thead>
+            <tbody>${witnessRowsHtml(sg.witness_b, sg.channel_id)}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="solve-row">
+      <button type="button" id="append-suggestion" class="btn primary"
+        ${full ? 'disabled' : ''}>按建议追加补测样本行（实测 RGB 留空待填）</button>
+      <span class="solver-meta">${full
+        ? '已有 12 组样本：仍显示本建议，但禁止追加；可先删除一组样本腾出位置。'
+        : `追加后将清除当前标定结果，原 ${calibSamples.length} 组样本保留；实测未填完整会拒绝提交。`}
+      </span>
+    </div>`;
+  $('#append-suggestion').addEventListener('click', onAppendSuggestion);
+}
+
+// 按建议创建待填实测 RGB 的补测样本行：驱动向量来自建议，实测一律留空（不预填预测值）
+function onAppendSuggestion() {
+  const sg = calibSuggestion;
+  if (!sg || calibSamples.length >= 12) return;
+  readCalibForm();
+  const orderedIds = channels.map((c) => c.id);
+  if (!orderedIds.includes(sg.channel_id)) return; // 通道已变化，建议本应已失效
+  const drives = {};
+  orderedIds.forEach((id, i) => { drives[id] = sg.drives[i] ?? 0; });
+  calibSamples.push({ drives, measured: [null, null, null] });
+  // 追加后清除旧标定结果（旧建议同时失效，由后续重新标定给出）
+  clearCalibResult();
+  renderCalibTable();
+  showBanner('info',
+    `<strong>已追加 1 组补测样本行</strong>（仅 ${esc(sg.channel_id)} 路 255 点亮，其余为 0；` +
+    `原样本保留）。请实际点亮后<strong>手工填入实测线性 RGB</strong>（不会自动填入预测值），` +
+    '三色填完整后再点击“反求满档读数”。');
+  // 滚动到新行
+  const rows = $$('#sample-tbody tr');
+  rows[rows.length - 1]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 /* ---------------- 单路熄灭容错配方 ---------------- */
@@ -1099,7 +1251,17 @@ function bindEvents() {
 
   $('#channel-tbody').addEventListener('input', (e) => {
     const tr = e.target.closest('tr');
-    if (tr) syncRowState(tr);
+    if (tr) {
+      const prevId = tr.dataset.id || '';
+      syncRowState(tr);
+      // 通道 ID 变化：标定补测建议与在途/迟到响应立即失效
+      const i = +tr.dataset.i;
+      const newId = channels[i] ? channels[i].id : '';
+      if (e.target.classList.contains('f-id') && newId !== prevId) {
+        clearCalibResult();
+      }
+      tr.dataset.id = newId;
+    }
     clearRobustResult();
     renderPathStartTable();
     clearPathResult();

@@ -193,11 +193,75 @@ class CalibChannelResult(BaseModel):
     b: int
 
 
+class CalibWitness(BaseModel):
+    """non_unique 补测建议中的一组合法满档 RGB 见证（禁止写回）。"""
+
+    matrix: list[CalibChannelResult] = Field(
+        ..., description="与入参 channels 同序的各路合法满档 RGB"
+    )
+    predicted: list[int] = Field(
+        ..., description="该见证在补测驱动向量下的整数（四舍五入后）RGB"
+    )
+
+    @field_validator("predicted")
+    @classmethod
+    def _check_predicted(cls, v: list[int]) -> list[int]:
+        if len(v) != 3 or any(not isinstance(m, int) or not 0 <= m <= 6000 for m in v):
+            raise ValueError("见证预测 RGB 必须是 3 个 0～6000 的整数")
+        return v
+
+
+class CalibSuggestion(BaseModel):
+    """non_unique 时附带的一次可执行补测建议（其他状态为 null）。"""
+
+    channel_id: str = Field(..., description="建议单独点亮的通道 ID（该路 255，其余 0）")
+    drives: list[int] = Field(
+        ..., description="补测驱动向量，与入参 channels 同序：恰有一个 255，其余为 0"
+    )
+    witnesses: list[CalibWitness] = Field(
+        ...,
+        min_length=2,
+        max_length=2,
+        description="两组合法满档 RGB 见证（均解释全部原样本，且在 drives 下整数 RGB 不同）",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "CalibSuggestion":
+        if any(not isinstance(d, int) or not 0 <= d <= 255 for d in self.drives):
+            raise ValueError("补测驱动级必须是 0～255 的整数")
+        ones = [i for i, d in enumerate(self.drives) if d == 255]
+        if len(ones) != 1 or any(d != 0 and d != 255 for d in self.drives):
+            raise ValueError("补测驱动向量必须恰有一路为 255、其余全部为 0")
+        n = len(self.drives)
+        if not all(len(w.matrix) == n for w in self.witnesses):
+            raise ValueError("见证矩阵的通道数必须与驱动向量一致")
+        for w in self.witnesses:
+            for ch in w.matrix:
+                for k in ("r", "g", "b"):
+                    val = getattr(ch, k)
+                    if not 0 <= val <= 1000:
+                        raise ValueError("见证满档 RGB 必须是 0～1000 的整数")
+                if ch.r == 0 and ch.g == 0 and ch.b == 0:
+                    raise ValueError("见证的每路满档 RGB 不能全为零")
+        w1, w2 = self.witnesses
+        if w1.predicted == w2.predicted:
+            raise ValueError("两组见证在补测驱动下的整数 RGB 必须不同")
+        m1 = tuple((ch.r, ch.g, ch.b) for ch in w1.matrix)
+        m2 = tuple((ch.r, ch.g, ch.b) for ch in w2.matrix)
+        if m1 == m2:
+            raise ValueError("两组见证的满档 RGB 矩阵必须不同")
+        return self
+
+
 class CalibrateResponse(BaseModel):
     # unique：唯一（channels 有值）；contradictory：样本矛盾；
-    # non_unique：存在多组合法参数；unknown：搜索未完成（不得据此下结论）
+    # non_unique：存在多组合法参数（suggestion 附带一次补测建议）；
+    # unknown：搜索未完成（不得据此下结论）
     status: Literal["unique", "contradictory", "non_unique", "unknown"]
     channels: list[CalibChannelResult] = []
+    # 仅 non_unique 有值：一次可执行补测建议（歧义见证，不可写回，
+    # 不保证补测一次即可唯一）
+    suggestion: CalibSuggestion | None = None
     message: str = ""
 
 

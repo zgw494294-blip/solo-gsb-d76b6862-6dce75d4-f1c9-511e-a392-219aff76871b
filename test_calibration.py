@@ -233,4 +233,156 @@ reject("驱动数与通道不符", channels=ch3,
 reject("驱动为浮点", channels=ch3,
        samples=[{"drives": [1.5, 0, 0], "measured": [0, 0, 0]}] + ok3[1:])
 
+
+# 13) non_unique 附带一次可执行补测建议（其他状态不提供建议）
+def assert_non_unique_suggestion(name, ids, samples, truth=None):
+    r = calibrate(ids, samples, time_limit_seconds=10)
+    assert r.status == "non_unique", f"{name}: 期望 non_unique，实得 {r.status}"
+    sg = r.suggestion
+    assert sg is not None, f"{name}: non_unique 必须附带补测建议"
+    n = len(ids)
+    # 驱动向量：恰有一路 255、其余全 0
+    assert len(sg.drives) == n and sorted(sg.drives) == [0] * (n - 1) + [255]
+    p = sg.channel_index
+    assert 0 <= p < n and sg.drives[p] == 255
+    assert len(sg.witnesses) == 2
+    w1, w2 = sg.witnesses
+    m1, m2 = w1.matrix, w2.matrix
+    # 两组合法满档 RGB：每路三色不全为零、取值 0～1000、矩阵确实不同
+    assert m1 != m2
+    for mat in (m1, m2):
+        assert len(mat) == n
+        for row in mat:
+            assert all(0 <= v <= 1000 for v in row) and row != (0, 0, 0)
+    # 两组见证都能解释全部原样本
+    for mat in (m1, m2):
+        for smp in samples:
+            assert predicted_rgb(list(mat), smp.drives) == smp.measured, \
+                f"{name}: 见证未能解释样本 {smp}"
+    # 单路点亮时预测整数 RGB 恰为该路满档读数，两组见证该路不同 ⇒ 预测不同
+    assert w1.predicted == m1[p] and w2.predicted == m2[p]
+    assert w1.predicted != w2.predicted
+    print(f"[OK] {name}: 补测建议（点亮 {ids[p]}，见证预测 {w1.predicted} vs {w2.predicted}）")
+    return r
+
+
+r = assert_non_unique_suggestion(
+    "一路从不点亮-补测建议",
+    IDS3,
+    [mk((255, 0, 0)), mk((0, 255, 0)), mk((100, 100, 0))],
+)
+
+assert_non_unique_suggestion(
+    "驱动过小粒度粗-补测建议",
+    IDS3,
+    [mk((1, 0, 0)), mk((0, 1, 0)), mk((0, 0, 1))],
+)
+
+# 14) 按建议补测（用真值实测）后按原流程重算 → 唯一，且写回参数等于真值
+sg = r.suggestion
+probe_measured = predicted_rgb(TRUTH3, sg.drives)
+r2 = calibrate(
+    IDS3,
+    [mk((255, 0, 0)), mk((0, 255, 0)), mk((100, 100, 0)),
+     CalibSample(sg.drives, probe_measured)],
+    time_limit_seconds=10,
+)
+assert r2.status == "unique", r2.status
+assert r2.channels == [("R", *TRUTH3[0]), ("G", *TRUTH3[1]), ("B", *TRUTH3[2])]
+assert r2.suggestion is None
+print("[OK] 按建议补测后重算=唯一且无建议")
+
+# 15) unique / contradictory 不提供建议
+assert calibrate(
+    IDS3,
+    [mk((255, 0, 0)), mk((0, 255, 0)), mk((0, 0, 255))],
+    time_limit_seconds=10,
+).suggestion is None
+assert calibrate(
+    IDS3,
+    [
+        CalibSample((255, 0, 0), (999, 120, 40)),
+        CalibSample((255, 0, 0), (998, 120, 40)),
+        mk((0, 255, 0)),
+        mk((0, 0, 255)),
+    ],
+    time_limit_seconds=10,
+).suggestion is None
+print("[OK] unique/contradictory 不提供补测建议")
+
+# 16) 响应模型（CalibrateResponse）能序列化建议，且拒绝畸形建议
+from app.schemas import CalibrateResponse, CalibSuggestion, CalibWitness
+
+resp = CalibrateResponse(
+    status="non_unique",
+    channels=[],
+    suggestion=CalibSuggestion(
+        channel_id="B",
+        drives=[0, 0, 255],
+        witnesses=[
+            CalibWitness(
+                matrix=[
+                    {"id": "R", "r": 1000, "g": 120, "b": 40},
+                    {"id": "G", "r": 160, "g": 1000, "b": 90},
+                    {"id": "B", "r": 1, "g": 0, "b": 0},
+                ],
+                predicted=[1, 0, 0],
+            ),
+            CalibWitness(
+                matrix=[
+                    {"id": "R", "r": 1000, "g": 120, "b": 40},
+                    {"id": "G", "r": 160, "g": 1000, "b": 90},
+                    {"id": "B", "r": 1, "g": 1, "b": 1},
+                ],
+                predicted=[1, 1, 1],
+            ),
+        ],
+    ),
+    message="x",
+)
+payload = resp.model_dump()
+assert payload["suggestion"]["drives"] == [0, 0, 255]
+assert payload["suggestion"]["channel_id"] == "B"
+print("[OK] CalibrateResponse 序列化补测建议")
+
+
+def reject_suggestion(name, **kw):
+    try:
+        CalibSuggestion(**kw)
+    except ValidationError:
+        print(f"[OK] {name}: 拒绝畸形建议")
+        return
+    raise AssertionError(f"{name}: 应拒绝却通过")
+
+
+good_w = lambda br, bg, bb, pr, pg, pb: CalibWitness(
+    matrix=[
+        {"id": "R", "r": 1000, "g": 120, "b": 40},
+        {"id": "G", "r": 160, "g": 1000, "b": 90},
+        {"id": "B", "r": br, "g": bg, "b": bb},
+    ],
+    predicted=[pr, pg, pb],
+)
+good_kw = dict(
+    channel_id="B",
+    drives=[0, 0, 255],
+    witnesses=[good_w(1, 0, 0, 1, 0, 0), good_w(1, 1, 1, 1, 1, 1)],
+)
+CalibSuggestion(**good_kw)  # 基线合法
+reject_suggestion("驱动两个255", **{**good_kw, "drives": [255, 0, 255]})
+reject_suggestion("驱动含非0/255", **{**good_kw, "drives": [0, 1, 255]})
+reject_suggestion("见证预测相同", **{**good_kw, "witnesses": [
+    good_w(1, 0, 0, 1, 0, 0), good_w(1, 1, 1, 1, 0, 0)]})
+reject_suggestion("见证矩阵相同", **{**good_kw, "witnesses": [
+    good_w(1, 0, 0, 1, 0, 0), good_w(1, 0, 0, 1, 0, 0)]})
+reject_suggestion("见证全零路", **{**good_kw, "witnesses": [
+    CalibWitness(matrix=[
+        {"id": "R", "r": 1000, "g": 120, "b": 40},
+        {"id": "G", "r": 160, "g": 1000, "b": 90},
+        {"id": "B", "r": 0, "g": 0, "b": 0}], predicted=[0, 0, 0]),
+    good_w(1, 1, 1, 1, 1, 1)]})
+reject_suggestion("见证矩阵通道数不符", **{**good_kw, "witnesses": [
+    CalibWitness(matrix=[{"id": "R", "r": 1, "g": 0, "b": 0}], predicted=[1, 0, 0]),
+    good_w(1, 1, 1, 1, 1, 1)]})
+
 print("\n全部通过 ✔")

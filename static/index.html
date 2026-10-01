@@ -131,6 +131,11 @@
       整数线性 RGB。实测值按「各色实际值 = Σ(满档读数 × 驱动级) ÷ 255，再<strong>四舍五入到整数</strong>」解释，
       后端用整数约束反求每路 0～1000 满档 RGB（三色不全为零）；样本矛盾、标定不唯一、搜索未完成都会明确报告，
       <strong>只有证明唯一时才允许写回通道表（保留原功率）</strong>。
+      标定<strong>不唯一</strong>时，结果区会附<strong>一次可执行补测建议</strong>：
+      给出「某一路单独 255、其余 0」的补测驱动向量与两组合法满档 RGB 见证
+      （二者在该驱动下的整数 RGB 不同），可一键追加为<strong>实测值留空</strong>的样本行；
+      见证仅用于说明歧义、<strong>不能写回</strong>，系统<strong>不会代填预测值</strong>，
+      也不保证补测一次即可唯一。
     </p>
     <div class="table-scroll">
       <table class="grid calib-grid" id="sample-table">
@@ -147,6 +152,7 @@
 
     <div id="calib-result" hidden>
       <div class="calib-status" id="calib-status"></div>
+      <div id="calib-suggestion" hidden></div>
       <div id="calib-unique-block" hidden>
         <div class="table-scroll">
           <table class="grid" id="calib-table">

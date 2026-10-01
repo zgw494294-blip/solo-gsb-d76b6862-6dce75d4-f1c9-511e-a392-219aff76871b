@@ -49,11 +49,39 @@ class CalibSample:
 
 
 @dataclass(frozen=True)
+class CalibWitness:
+    """一组能解释全部原样本的合法满档 RGB（歧义见证，仅供展示，禁止写回）。"""
+
+    # 与入参 channels 同序的各路满档 (r, g, b)
+    matrix: tuple[tuple[int, int, int], ...]
+    # 该见证在补测驱动向量下的整数（四舍五入后）RGB
+    predicted: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class CalibSuggestion:
+    """non_unique 时给出的一次可执行补测建议（其他状态为 None）。
+
+    仅是歧义见证，不允许写回，也不保证补测一次即可唯一。
+    """
+
+    # 建议点亮的通道序号（与 channel_ids 同序）：该路单独 255、其余 0
+    channel_index: int
+    # 补测驱动向量（一路 255，其余全 0）
+    drives: tuple[int, ...]
+    # 两组合法满档 RGB 见证；二者都能解释全部原样本，
+    # 且在 drives 下的整数 RGB（w.predicted）不同
+    witnesses: tuple[CalibWitness, CalibWitness]
+
+
+@dataclass(frozen=True)
 class CalibResult:
     status: CalibStatus
     # 与入参 channels 同序的 (id, r, g, b)；仅 unique 时有值
     channels: list[tuple[str, int, int, int]]
     message: str
+    # 仅 non_unique 时有值：一次可执行补测建议（见证，不可写回）
+    suggestion: CalibSuggestion | None = None
 
 
 def round_half_up(value: float) -> int:
@@ -72,6 +100,38 @@ def predicted_rgb(
         s = sum(readings[i][c] * drives[i] for i in range(len(drives)))
         out.append(round_half_up(s / 255.0))
     return out[0], out[1], out[2]
+
+
+def _build_suggestion(
+    n: int,
+    samples: list[CalibSample],
+    candidate: list[tuple[int, int, int]],
+    other: list[tuple[int, int, int]],
+) -> CalibSuggestion:
+    """由两组不同的合法参数构造一次补测建议。
+
+    选取两组参数中首个读数不同的通道 p，以「p 路单独 255、其余 0」为补测
+    驱动向量：该向量下实测整数 RGB 恰好等于该路满档读数（其余路贡献为 0），
+    故两组见证给出不同整数 RGB。两组见证均来自可行解，必然解释全部原样本。
+    """
+    # 防御性核对：见证矩阵确实解释全部原样本（见证的根本含义）
+    for readings in (candidate, other):
+        for smp in samples:
+            if predicted_rgb(readings, smp.drives) != smp.measured:
+                raise AssertionError("补测见证未能解释全部原样本")
+
+    p = next(
+        i
+        for i in range(n)
+        if any(candidate[i][c] != other[i][c] for c in range(3))
+    )
+    probe = tuple(255 if i == p else 0 for i in range(n))
+    w1 = CalibWitness(matrix=tuple(candidate), predicted=predicted_rgb(candidate, probe))
+    w2 = CalibWitness(matrix=tuple(other), predicted=predicted_rgb(other, probe))
+    # 单路点亮时预测值就是该路满档读数，见证在第 p 路不同 ⇒ 预测必不同
+    if w1.predicted == w2.predicted:
+        raise AssertionError("补测见证在建议驱动下的整数 RGB 未区分开")
+    return CalibSuggestion(channel_index=p, drives=probe, witnesses=(w1, w2))
 
 
 def calibrate(
@@ -163,15 +223,21 @@ def calibrate(
 
     st2, solver2 = run(m2)
     if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        other = [
+            tuple(solver2.value(x2[(i, c)]) for c in range(3)) for i in range(n)
+        ]
+        suggestion = _build_suggestion(n, samples, candidate, other)
         return CalibResult(
             status="non_unique",
             channels=[],
             message=(
                 "标定不唯一：存在多组合法的各路满档 RGB 都能解释全部样本"
-                "（模型已找到两个不同的合法参数）。请增加样本数量或覆盖更多"
-                "驱动级组合（尤其是各路单独点亮的样本），使方程组足以唯一"
-                "确定每路读数。"
+                "（模型已找到两个不同的合法参数）。已附一次可执行补测建议："
+                "按建议的驱动向量（某一路单独 255、其余 0）补测一组实测 RGB；"
+                "两组见证在该驱动下给出不同整数 RGB，补测值可剔除其中之一。"
+                "见证仅供参考、不能写回，且不保证补测一次即可唯一。"
             ),
+            suggestion=suggestion,
         )
     if st2 == cp_model.INFEASIBLE:
         return CalibResult(

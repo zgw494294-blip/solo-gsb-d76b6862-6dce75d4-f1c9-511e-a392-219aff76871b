@@ -9,9 +9,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .schemas import (
+    CalibChannelResult,
+    CalibSuggestion,
+    CalibWitness,
     CalibrateRequest,
     CalibrateResponse,
-    CalibChannelResult,
     ChannelSolution,
     PathSolveRequest,
     PathSolveResponse,
@@ -170,12 +172,32 @@ def api_calibrate(req: CalibrateRequest) -> CalibrateResponse:
         for s in req.samples
     ]
     result = calibrate(ids, samples)
+
+    def witness_out(w):
+        return CalibWitness(
+            matrix=[
+                CalibChannelResult(id=ids[i], r=row[0], g=row[1], b=row[2])
+                for i, row in enumerate(w.matrix)
+            ],
+            predicted=list(w.predicted),
+        )
+
+    suggestion = None
+    if result.suggestion is not None:
+        sg = result.suggestion
+        suggestion = CalibSuggestion(
+            channel_id=ids[sg.channel_index],
+            drives=list(sg.drives),
+            witnesses=[witness_out(sg.witnesses[0]), witness_out(sg.witnesses[1])],
+        )
+
     return CalibrateResponse(
         status=result.status,
         channels=[
             CalibChannelResult(id=cid, r=r, g=g, b=b)
             for (cid, r, g, b) in result.channels
         ],
+        suggestion=suggestion,
         message=result.message,
     )
 
